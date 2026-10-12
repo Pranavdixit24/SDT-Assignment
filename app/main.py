@@ -24,7 +24,8 @@ load_dotenv()
 MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017")
 MONGO_DB = os.getenv("MONGO_DB", "attendance_db")
 
-client: MongoClient = MongoClient(MONGO_URI)
+# tz_aware=True ensures PyMongo returns timezone-aware UTC datetimes
+client: MongoClient = MongoClient(MONGO_URI, tz_aware=True)
 db = client[MONGO_DB]
 
 IST = timezone(timedelta(hours=5, minutes=30))
@@ -73,6 +74,15 @@ app = FastAPI(
 # --------------------------------------------------------------------------- #
 # Helpers & Rules (R1 - R10)
 # --------------------------------------------------------------------------- #
+def ensure_utc(dt: Optional[datetime]) -> Optional[datetime]:
+    """Ensure a datetime is timezone-aware UTC."""
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
 def round_half_up(val: Optional[float | int | Decimal], decimals: int = 2) -> Optional[float]:
     """R8: Rounding of reported numbers half-up (rates: 4 decimals half-up)."""
     if val is None:
@@ -99,8 +109,7 @@ def utc_dt_to_ms(dt: Optional[datetime]) -> Optional[int]:
         return None
     if isinstance(dt, (int, float)):
         return int(dt)
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
+    dt = ensure_utc(dt)
     return int(dt.timestamp() * 1000)
 
 
@@ -112,10 +121,9 @@ def compute_attendance_date(
     Overnight shifts (shift_end <= shift_start): a punch-in earlier than shift_end
     belongs to the shift that started the previous day.
     """
-    punch_in_ist = punch_in_dt.astimezone(IST)
+    punch_in_ist = ensure_utc(punch_in_dt).astimezone(IST)
     is_overnight = shift_end <= shift_start
 
-    end_h, end_m = map(int, shift_end.split(":"))
     if is_overnight and punch_in_ist.time() < datetime.strptime(shift_end, "%H:%M").time():
         assigned_date = punch_in_ist.date() - timedelta(days=1)
     else:
@@ -131,11 +139,10 @@ def compute_late_minutes(
     R2: Grace period 10 minutes. Late only if punch-in is strictly > 10:00 after shift_start.
     Then late_minutes = whole minutes (floor) since shift_start, not since grace period ended.
     """
-    h, m = map(int, shift_start.split(":"))
     sched_start = datetime.fromisoformat(f"{attendance_date}T{shift_start}:00").replace(
         tzinfo=IST
     )
-    punch_in_ist = punch_in_dt.astimezone(IST)
+    punch_in_ist = ensure_utc(punch_in_dt).astimezone(IST)
     diff_sec = (punch_in_ist - sched_start).total_seconds()
     if diff_sec > 600:
         return int(diff_sec // 60)
@@ -144,7 +151,7 @@ def compute_late_minutes(
 
 def compute_work_hours(punch_in_dt: datetime, punch_out_dt: datetime) -> float:
     """R4: (punch_out - punch_in) in seconds / 3600, rounded to 2 decimals half-up."""
-    diff_sec = (punch_out_dt - punch_in_dt).total_seconds()
+    diff_sec = (ensure_utc(punch_out_dt) - ensure_utc(punch_in_dt)).total_seconds()
     return round_half_up(diff_sec / 3600.0, 2)  # type: ignore
 
 
@@ -168,7 +175,7 @@ def compute_overtime(
     sched_end = datetime.fromisoformat(f"{end_d.isoformat()}T{shift_end}:00").replace(
         tzinfo=IST
     )
-    punch_out_ist = punch_out_dt.astimezone(IST)
+    punch_out_ist = ensure_utc(punch_out_dt).astimezone(IST)
     diff_sec = (punch_out_ist - sched_end).total_seconds()
     if diff_sec >= 1800:
         return int(diff_sec // 60)
@@ -366,7 +373,7 @@ def punch_out(body: PunchOutRequest):
 
     # Find employee's most recent record whose punch_in <= punched_at
     rec = db.attendance_logs.find_one(
-        {"emp_code": body.emp_code, "punch_in": {"$lte": punch_out_dt}},
+        {"emp_code": body.emp_code, "punch_in": {"$ne": None, "$lte": punch_out_dt}},
         sort=[("punch_in", pymongo.DESCENDING)],
     )
     if not rec:
@@ -375,9 +382,7 @@ def punch_out(body: PunchOutRequest):
     if rec.get("punch_out") is not None:
         raise HTTPException(status_code=409, detail="Already punched out")
 
-    punch_in_dt = rec["punch_in"]
-    if punch_in_dt.tzinfo is None:
-        punch_in_dt = punch_in_dt.replace(tzinfo=timezone.utc)
+    punch_in_dt = ensure_utc(rec["punch_in"])
 
     # Validation: punched_at <= punch_in or > 24 hours after punch_in
     if punch_out_dt <= punch_in_dt:
@@ -419,7 +424,7 @@ def list_attendance(
     emp_code: Optional[str] = None,
     date_from: Optional[str] = Query(None, pattern=r"^\d{4}-\d{2}-\d{2}$"),
     date_to: Optional[str] = Query(None, pattern=r"^\d{4}-\d{2}-\d{2}$"),
-    status: Optional[str] = None,
+    status: Optional[Literal["PRESENT", "ABSENT", "LEAVE", "WFH", "ON_DUTY"]] = None,
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=100),
 ):
@@ -466,8 +471,8 @@ def regularize_attendance(
         raise HTTPException(status_code=404, detail="Attendance record not found")
 
     old_status = rec["status"]
-    old_punch_in = rec.get("punch_in")
-    old_punch_out = rec.get("punch_out")
+    old_punch_in = ensure_utc(rec.get("punch_in"))
+    old_punch_out = ensure_utc(rec.get("punch_out"))
     old_work_hours = rec.get("work_hours")
     old_late_minutes = rec.get("late_minutes", 0)
     old_overtime_minutes = rec.get("overtime_minutes", 0)
@@ -859,12 +864,7 @@ def department_summary(
                 "avg_work_hours": {
                     "$cond": [
                         {"$gt": ["$work_hours_count", 0]},
-                        {
-                            "$round": [
-                                {"$divide": ["$work_hours_sum", "$work_hours_count"]},
-                                2,
-                            ]
-                        },
+                        {"$divide": ["$work_hours_sum", "$work_hours_count"]},
                         None,
                     ]
                 },
@@ -878,6 +878,9 @@ def department_summary(
     ]
 
     items = list(db.employees.aggregate(pipeline))
+    for item in items:
+        if item.get("avg_work_hours") is not None:
+            item["avg_work_hours"] = round_half_up(item["avg_work_hours"], 2)
     return {"month": month, "items": items}
 
 
@@ -1085,7 +1088,7 @@ def department_trend(
                                 {"$gt": ["$headcount", 0]},
                             ]
                         },
-                        {"$round": [{"$divide": ["$present_count", "$headcount"]}, 4]},
+                        {"$divide": ["$present_count", "$headcount"]},
                         None,
                     ]
                 }
@@ -1103,17 +1106,6 @@ def department_trend(
             }
         },
         {
-            "$addFields": {
-                "moving_avg_7d": {
-                    "$cond": [
-                        {"$ne": ["$moving_avg_7d", None]},
-                        {"$round": ["$moving_avg_7d", 4]},
-                        None,
-                    ]
-                }
-            }
-        },
-        {
             "$project": {
                 "_id": 0,
                 "date": 1,
@@ -1128,6 +1120,12 @@ def department_trend(
     ]
 
     items = list(db.attendance_logs.aggregate(pipeline))
+    for item in items:
+        if item.get("attendance_rate") is not None:
+            item["attendance_rate"] = round_half_up(item["attendance_rate"], 4)
+        if item.get("moving_avg_7d") is not None:
+            item["moving_avg_7d"] = round_half_up(item["moving_avg_7d"], 4)
+
     return {"department": department, "items": items}
 
 
@@ -1140,7 +1138,7 @@ def explain_endpoint(
     limit: Optional[int] = Query(10, ge=1, le=50),
     date_from: Optional[str] = Query(None, pattern=r"^\d{4}-\d{2}-\d{2}$"),
     date_to: Optional[str] = Query(None, pattern=r"^\d{4}-\d{2}-\d{2}$"),
-    status: Optional[str] = None,
+    status: Optional[Literal["PRESENT", "ABSENT", "LEAVE", "WFH", "ON_DUTY"]] = None,
     from_date: Optional[str] = Query(None, alias="from", pattern=r"^\d{4}-\d{2}-\d{2}$"),
     to_date: Optional[str] = Query(None, alias="to", pattern=r"^\d{4}-\d{2}-\d{2}$"),
     page: int = Query(1, ge=1),
