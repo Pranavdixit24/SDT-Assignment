@@ -1,26 +1,53 @@
-# Candidate kit
+# Employee Attendance & Analytics API
 
-Read in this order:
+Submission for Software Engineer Trainee role at HROne.
 
-1. `PROBLEM_STATEMENT.docx`: what you are asked to do, how it is evaluated.
-2. `openapi.yaml`: the API contract and the business rules (R1 - R10).
-3. `DATA_MODEL.md`: what is stored in MongoDB, with nine sample documents.
-4. `app/main.py`: the starter. Put **all** your code in this one file. It must start with `uvicorn app.main:app --port 8000`.
-5. `REVIEW.md`, `DECISIONS.md`: templates to fill in.
+## Tech Stack
+- **Framework**: FastAPI (Python 3.11+)
+- **Server**: Uvicorn
+- **Database**: MongoDB 6.0+ (Tested against MongoDB 7.0/8.x)
+- **ODM/Driver**: PyMongo
+- **Validation**: Pydantic v2
 
-`sample_data/` holds the nine sample documents as MongoDB Extended JSON; `sample_seed.py` loads them. The grader's dataset is
-much larger and contains cases they do not show.
+## How to Run
 
-## Local setup
-```bash
-python -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
-cp .env.example .env            # set MONGO_URI / MONGO_DB (local docker: docker run -p 27017:27017 mongo:7)
-python sample_seed.py
-uvicorn app.main:app --port 8000 --reload
-```
-MongoDB **6.0 or newer** is required (the grader uses 7.0). MongoDB Atlas free tier (M0) works.
+1. **Install dependencies:**
+   ```bash
+   pip install -r requirements.txt
+   ```
 
-## Submit
-A public Git repository with `app/main.py`, `requirements.txt`, `REVIEW.md`, `DECISIONS.md` and a short `README.md`.
-No `.env`, no secrets, no Dockerfile.
+2. **Configure environment (Optional):**
+   Environment variables `MONGO_URI` and `MONGO_DB` are read dynamically with fallback to local defaults:
+   - `MONGO_URI` (defaults to `mongodb://localhost:27017`)
+   - `MONGO_DB` (defaults to `attendance_db`)
+
+3. **Seed sample data (Optional):**
+   ```bash
+   python sample_seed.py
+   ```
+
+4. **Start the API:**
+   ```bash
+   uvicorn app.main:app --port 8000
+   ```
+   Interactive API docs are available at `http://localhost:8000/docs`.
+
+## Project Structure
+- `app/main.py`: Complete FastAPI application containing all endpoints, business rules (R1–R10), aggregation pipelines, and startup index creation.
+- `requirements.txt`: Python dependencies.
+- `REVIEW.md`: Comprehensive code review identifying and fixing 16 defects in the starter code.
+- `DECISIONS.md`: Design rationale covering indexes, concurrency race handling, tie ranking, headcount calculation, and 100x scaling.
+- `openapi.yaml`: API specification and contract.
+- `DATA_MODEL.md`: MongoDB schema documentation.
+
+## Features & Implementation Highlights
+- **Startup Index Creation**: Lifespan handler idempotently creates all indexes on `employees` and `attendance_logs` for `IXSCAN` execution.
+- **Race-Safe Attendance**: Atomic database operations and compound unique indexes prevent duplicate punch-ins and double punch-outs under concurrency.
+- **Overnight Shift Handling**: Accurately maps punch-ins before `shift_end` to the shift starting on the previous calendar day (Rule R1).
+- **Rounding & Precision**: Strict half-up rounding (R8) using `decimal.Decimal(..., rounding=ROUND_HALF_UP)`.
+- **Pure Database Aggregations**:
+  - `employee_monthly`: Monthly summaries with working days computed from `joined_on`.
+  - `department_summary`: Cross-collection `$lookup` ensuring employees with zero logs are counted in headcount (R9).
+  - `late_leaderboard`: Standard competition ranking (1, 2, 2, 4) using MongoDB `$setWindowFields` with `$rank`.
+  - `department_trend`: Calendar gap-filling via `$densify` and 7-day moving averages via `$setWindowFields`.
+  - `/admin/explain/{endpoint}`: Returns raw MongoDB `executionStats` confirming index scans (`IXSCAN`) and zero collection scans (`COLLSCAN`).
